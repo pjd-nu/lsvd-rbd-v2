@@ -10,16 +10,27 @@
 #ifndef READ_CACHE_H
 #define READ_CACHE_H
 
-#include "translate.h"
+#include <stddef.h>
+#include <stdint.h>
+
+#include <vector>
+#include <map>
+
+class translate;
+class objmap;
+class backend;
+class nvme;
+
+struct j_read_super;
+#include "extent.h"
 
 class read_cache {
 public:
 
     virtual ~read_cache() {};
     
-    virtual std::pair<size_t,size_t>
-        async_read(size_t offset, char *buf, size_t len,
-                   void (*cb)(void*), void *ptr) = 0;
+    virtual std::tuple<size_t,size_t,request*>
+        async_readv(size_t offset, smartiov *iov) = 0;
 
     /* debugging. 
      * TODO: document the first three methods
@@ -27,7 +38,7 @@ public:
     virtual void do_add(extmap::obj_offset unit, char *buf) = 0; 
     virtual void do_evict(int n) = 0;
     virtual void write_map(void) = 0;
-
+    
     /* get superblock, flattened map, vector of free blocks, extent map
      * only returns ones where ptr!=NULL
      */
@@ -37,7 +48,8 @@ public:
 };
 
 extern read_cache *make_read_cache(uint32_t blkno, int _fd, bool nt,
-                                   translate *_be, objmap *_om, backend *_io);
+                                   translate *_be, extmap::objmap *map,
+                                   std::shared_mutex *m, backend *_io);
 
 #endif
 

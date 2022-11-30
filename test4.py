@@ -10,6 +10,8 @@ import mkdisk
 import test2 as t2
 import test3 as t3
 
+os.environ["LSVD_BACKEND"] = "file"
+os.environ["LSVD_CONFIG_FILE"] = "/dev/null"
 nvme = '/tmp/nvme'
 img = '/tmp/bkt/obj'
 dir = os.path.dirname(img)
@@ -21,7 +23,7 @@ xlate,wcache,rcache = None,None,None
 
 def startup():
     global xlate,wcache,rcache
-    mkdisk.cleanup(img)
+    mkdisk.cleanup_files(img)
     sectors = 10*1024*2 # 10MB
     mkdisk.mkdisk(img, sectors)
     mkcache.mkcache(nvme)
@@ -153,4 +155,3 @@ if __name__ == '__main__':
     unittest.main(exit=False)
     lsvd.io_stop()
     time.sleep(0.1)
-

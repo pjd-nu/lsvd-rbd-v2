@@ -11,6 +11,7 @@ import time
 import signal
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 
+os.environ["LSVD_BACKEND"] = "file"
 img = '/tmp/bkt/obj'
 dir = os.path.dirname(img)
 
@@ -173,16 +174,18 @@ class tests(unittest.TestCase):
         #print('Test 4')
         cleanup()
         write_super(img, 0, 1)
-        xlate = lsvd.translate(img, 1, True)
+        xlate = lsvd.translate(img, 1, False)
         d = b'X' * 4096
         xlate.write(0, d)
         xlate.write(8192,d)
         xlate.write(4096,d)
+        xlate.flush()
         n = xlate.checkpoint()
         hdr, ckpt_hdr, ckpts, objs, exts = read_ckpt(img + ('.%08x' % n))
         self.assertEqual([_ for _ in ckpts], [2])
         exts = [_ for _ in map(lambda x: [x.lba,x.len,x.obj,x.offset], exts)]
-        self.assertEqual(exts, [[0,8,1,0],[8,8,1,16],[16,8,1,8]])
+        # note - offsets include 1 header sector
+        self.assertEqual(exts, [[0,8,1,1],[8,8,1,17],[16,8,1,9]])
         xlate.close()
 
     def test_5_flushthread(self):
@@ -249,12 +252,13 @@ class tests(unittest.TestCase):
         xlate.write(4096, d)
         xlate.flush()
         time.sleep(0.1)
+        
         self.assertTrue(os.access('/tmp/bkt/obj.00000003', os.R_OK))
         self.assertFalse(os.access('/tmp/bkt/obj.00000004', os.R_OK))
         n = xlate.checkpoint()
         self.assertEqual(n, 4)
         self.assertTrue(os.access('/tmp/bkt/obj.00000004', os.R_OK))
-
+        
         hdr, ckpt_hdr, ckpts, objs, exts = read_ckpt(img + ('.%08x' % n))
         self.assertEqual(len(objs), 2)
         self.assertEqual([1, 3], [_.seq for _ in objs])

@@ -30,20 +30,20 @@ blk_fmt = lambda x: '%d%s' % (x, '' if x < npages else ' *INVALID*')
 hdr_pp = [['magic', magic], ['type', fieldnames], ['vol_uuid', fmt_uuid],
               ['write_super', blk_fmt], ['read_super', blk_fmt]]
 
-wsup_pp = [['magic', magic], ['type', fieldnames], ['vol_uuid', fmt_uuid],
+wsup_pp = [['magic', magic], ['type', fieldnames], ['clean', lambda x: "YES" if x else "NO"],
                ['seq', '%d'], ['meta_base', '%d'], ['meta_limit', '%d'],
-               ['base', '%d'], ['limit', '%d'], ['next', '%d'], ['oldest', '%d'], 
+               ['base', '%d'], ['limit', '%d'], ['next', '%d'], 
                ['map_start', '%d'], ['map_entries', '%d'],
                ['len_start', '%d'], ['len_entries', '%d']]
 
-rsup_pp = [["magic", magic], ["type", fieldnames], ['vol_uuid', fmt_uuid], ["unit_size", '%d'], 
-               ["base", '%d'], ["units", '%d'], ["map_start", '%d'],["map_blocks", '%d'],
-               ["evict_type", '%d'], ["evict_start", '%d'], ["evict_blocks", '%d']]
+rsup_pp = [["magic", magic], ["type", fieldnames], ["unit_size", '%d'], 
+               ["base", '%d'], ["units", '%d'], ["map_start", '%d'],["map_blocks", '%d']]
 
 parser = argparse.ArgumentParser(description='Read SSD cache')
 parser.add_argument('--write', help='print write cache details', action='store_true')
 parser.add_argument('--writemap', help='print write cache map', action='store_true')
 parser.add_argument('--read', help='print read cache details', action='store_true')
+parser.add_argument('--nowrap', help='one entry per line', action='store_true')
 parser.add_argument('device', help='cache device/file')
 args = parser.parse_args()
 
@@ -69,38 +69,29 @@ if super.read_super < npages:
     prettyprint(r_super, rsup_pp)
 
 def read_exts(b, npgs, n):
-    buf = os.pread(fd, npgs*4096, b*4096)
     bytes = n*lsvd.sizeof_j_map_extent
-    e = (lsvd.j_map_extent*n).from_buffer(bytearray(buf[0:bytes]))
+    buf = os.pread(fd, bytes, b*4096)
+    e = (lsvd.j_map_extent*n).from_buffer(bytearray(buf))
     return [(_.lba, _.len, _.plba) for _ in e]
 
 def read_lens(b, npgs, n):
-    buf = os.pread(fd, npgs*4096, b*4096)
     bytes = n*lsvd.sizeof_j_length
-    l = (lsvd.j_length*n).from_buffer(bytearray(buf[0:bytes]))
+    buf = os.pread(fd, bytes, b*4096)
+    l = (lsvd.j_length*n).from_buffer(bytearray(buf))
     return [(_.page, _.len) for _ in l]
     
 if args.write and super.write_super < npages:
-    b = w_super.oldest
-    while True:
+    b = w_super.base
+    while b < w_super.limit:
         [j,e] = t3.c_hdr(fd, b)
-    #    if j.type != lsvd.LSVD_J_DATA:
-    #        break
         if j.magic != lsvd.LSVD_MAGIC:
-            break
-        if j.type == lsvd.LSVD_J_CKPT:    # not relevant anymore
-            print('\ncheckpoint - map:', b)
-            e = read_exts(b+1, w_super.map_blocks, w_super.map_entries)
-            print(' '.join(['(%d+%d->%d)' % _ for _ in e]))
-            print('\ncheckpoint - lengths:', )
-            l = read_lens(b+1+w_super.map_blocks, w_super.len_blocks, w_super.len_entries)
-            print(' '.join(['([%d]=%d)' % _ for _ in l]))
-            
-        else:
-            h_pp = [["magic", magic], ["type", fieldnames], ["seq", '%d'], ["len", '%d']]
-            print('\ndata: (%d)' % b)
-            prettyprint(j, h_pp)
-            print('extents    :', ' '.join(['%d+%d' % (_.lba,_.len) for _ in e]))
+            b += 1
+            continue
+
+        h_pp = [["magic", magic], ["type", fieldnames], ["seq", '%d'], ["len", '%d'], ["prev", '%d']]
+        print('\ndata: (%d)' % b)
+        prettyprint(j, h_pp)
+        print('extents    :', ' '.join(['%d+%d' % (_.lba,_.len) for _ in e]))
         b = b + j.len
 
 def wrapjoin(prefix, linelen, items):
@@ -118,16 +109,24 @@ def wrapjoin(prefix, linelen, items):
 if args.writemap and w_super:
     print('\nwrite cache map:')
     e = read_exts(w_super.map_start, w_super.map_blocks, w_super.map_entries)
-    print(wrapjoin(' ', 80, ['%d+%d->%d' % _ for _ in e]))
+    if args.nowrap:
+        print('\n'.join(['%d+%d->%d' % _ for _ in e]))
+    else:
+        print(wrapjoin(' ', 80, ['%d+%d->%d' % _ for _ in e]))
+
     print('\nwrite cache lengths:')
     l = read_lens(w_super.len_start, w_super.len_blocks, w_super.len_entries)
-    print(wrapjoin(' ', 80, ['[%d]=%d' % _ for _ in l]))
+    if args.nowrap:
+        print('\n'.join(['[%d]=%d' % _ for _ in l]))
+    else:
+        print(wrapjoin(' ', 80, ['[%d]=%d' % _ for _ in l]))
 
 if args.read and r_super:
     nbytes = r_super.units * lsvd.sizeof_obj_offset
     print("map start:   ", r_super.map_start)
     buf = os.pread(fd, nbytes, r_super.map_start * 4096)
     oos = (lsvd.obj_offset * r_super.units).from_buffer(bytearray(buf))
+    oos = [_ for _ in filter(lambda x: x.obj != 0, oos)]
     print("\nread map:")
     print(wrapjoin(' ', 80, ['[%d] = %d.%d' % _ for _ in
                                  [(i, oos[i].obj, oos[i].offset) for i in range(len(oos))]]))

@@ -7,7 +7,10 @@
 
 #include <sys/uio.h>
 #include <string>
-#include "request.h"
+
+#include "fake_rbd.h"
+
+class request;
 
 class backend {
 public:
@@ -19,6 +22,7 @@ public:
     virtual int read_object(const char *name, iovec *iov, int iovcnt,
                             size_t offset) = 0;
     virtual int delete_object(const char *name) = 0;
+    virtual int delete_prefix(const char *prefix) = 0;
     
     /* async I/O
      */
@@ -26,6 +30,11 @@ public:
                                     iovec *iov, int iovcnt) = 0;
     virtual request *make_read_req(const char *name, size_t offset,
                                     iovec *iov, int iovcnt) = 0;
+    virtual request *make_read_req(const char *name, size_t offset,
+                                   char *buf, size_t len) = 0;
 };
+
+extern backend *make_file_backend(const char *prefix);
+extern backend *make_rados_backend(rados_ioctx_t io);
 
 #endif

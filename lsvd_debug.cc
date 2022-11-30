@@ -1,4 +1,5 @@
 #include <unistd.h>
+#include <uuid/uuid.h>
 
 #include <queue>
 #include <map>
@@ -11,37 +12,36 @@
 #include "lsvd_types.h"
 #include "smartiov.h"
 #include "fake_rbd.h"
+#include "config.h"
+#include "extent.h"
+#include "backend.h"
+#include "translate.h"
+#include "read_cache.h"
+#include "journal.h"
+#include "write_cache.h"
 #include "image.h"
 
-#include "extent.h"
-#include "journal.h"
 #include "objects.h"
 #include "request.h"
 
 #include "misc_cache.h"
 #include "nvme.h"
-#include "base_functions.h"
 
-#include "translate.h"
-#include "read_cache.h"
-#include "write_cache.h"
-#include "file_backend.h"
-#include "rados_backend.h"
+#include "config.h"
 
 /* types used to interface with some debug functions - must
  * match ctypes definitions in lsvd_types.py
  */
 struct _dbg {
 public:
-    int type = 0;
     translate   *lsvd;
     write_cache *wcache;
-    objmap      *omap;
+    extmap::objmap    obj_map;
+    std::shared_mutex obj_lock;
     read_cache  *rcache;
     backend     *io;
-    _dbg(int _t, translate *_l, write_cache *_w, objmap *_o,
-         read_cache *_r, backend *_io) : type(_t), lsvd(_l), wcache(_w),
-        omap(_o), rcache(_r), io(_io) {}
+    uuid_t       uuid;
+    lsvd_config  cfg;
 };
 
 // tuple :	used for retrieving maps
@@ -60,69 +60,69 @@ struct getmap_s {
     struct tuple *t;
 };
 
+extern translate *image_2_xlate(rbd_image_t image);
+
 /* debug functions
  */
 extern "C" int dbg_lsvd_write(rbd_image_t image, char *buffer, uint64_t offset, uint32_t size)
 {
-    fake_rbd_image *fri = (fake_rbd_image*)image;
+    auto xlate = image_2_xlate(image);
     iovec iov = {buffer, size};
-    size_t val = fri->lsvd->writev(offset, &iov, 1);
+    size_t val = xlate->writev(0, offset, &iov, 1);
     return val < 0 ? -1 : 0;
 }
+
+// struct rbd_image;
+extern rbd_image *make_rbd_image(backend *b, translate *t,
+				 write_cache *w, read_cache *r);
+
 extern "C" int dbg_lsvd_read(rbd_image_t image, char *buffer, uint64_t offset, uint32_t size)
 {
-    fake_rbd_image *fri = (fake_rbd_image*)image;
+    auto xlate = image_2_xlate(image);
     iovec iov = {buffer, size};
-    size_t val = fri->lsvd->readv(offset, &iov, 1);
+    size_t val = xlate->readv(offset, &iov, 1);
     return val < 0 ? -1 : 0;
 }
 extern "C" int dbg_lsvd_flush(rbd_image_t image)
 {
-    fake_rbd_image *fri = (fake_rbd_image*)image;
-    fri->lsvd->flush();
+    auto xlate = image_2_xlate(image);
+    xlate->flush();
     return 0;
 }
 extern "C" int xlate_open(char *name, int n, bool flushthread, void **p)
 {
-    backend *io = new file_backend();
-    objmap *omap = new objmap();
-    translate *lsvd = make_translate(io, omap);
-    auto rv = lsvd->init(name, n, flushthread);
-    auto d = new _dbg(1, lsvd, NULL, omap, NULL, io);
+    auto d = new _dbg();
+    d->io = make_file_backend(name);
+    d->lsvd = make_translate(d->io, &d->cfg, &d->obj_map, &d->obj_lock);
+    auto rv = d->lsvd->init(name, n, flushthread);
     *p = (void*)d;
     return rv;
 }
 extern "C" void xlate_close(_dbg *d)
 {
-    assert(d->type == 1);
     d->lsvd->shutdown();
     delete d->lsvd;
-    delete d->omap;
     delete d->io;
     delete d;
 }
 extern "C" int xlate_flush(_dbg *d)
 {
-    assert(d->type == 1);
     return d->lsvd->flush();
 }
 extern "C" int xlate_size(_dbg *d)
 {
-    assert(d->type == 1);
     return d->lsvd->mapsize();
 }
 extern "C" int xlate_read(_dbg *d, char *buffer, uint64_t offset, uint32_t size)
 {
-    assert(d->type == 1);
     iovec iov = {buffer, size};
     size_t val = d->lsvd->readv(offset, &iov, 1);
     return val < 0 ? -1 : 0;
 }
 extern "C" int xlate_write(_dbg *d, char *buffer, uint64_t offset, uint32_t size)
 {
-    assert(d->type == 1);
     iovec iov = {buffer, size};
-    size_t val = d->lsvd->writev(offset, &iov, 1);
+    size_t val = d->lsvd->writev(0, offset, &iov, 1);
     return val < 0 ? -1 : 0;
 }
 int getmap_cb(void *ptr, int base, int limit, int obj, int offset)
@@ -134,30 +134,32 @@ int getmap_cb(void *ptr, int base, int limit, int obj, int offset)
 }
 extern "C" int xlate_getmap(_dbg *d, int base, int limit, int max, struct tuple *t)
 {
-    assert(d->type == 1);
     getmap_s s = {0, max, t};
     d->lsvd->getmap(base, limit, getmap_cb, (void*)&s);
     return s.i;
 }
 extern "C" int xlate_frontier(_dbg *d)
 {
-    assert(d->type == 1);
     return d->lsvd->frontier();
 }
+
+extern int batch_seq(translate*);
+extern "C" int xlate_seq(_dbg *d)
+{
+    return batch_seq(d->lsvd);
+}
+
 extern "C" void xlate_reset(_dbg *d)
 {
-    assert(d->type == 1);
     d->lsvd->reset();
 }
 extern "C" int xlate_checkpoint(_dbg *d)
 {
-    assert(d->type == 1);
     return d->lsvd->checkpoint();
 }
 extern "C" void wcache_open(_dbg *d, uint32_t blkno, int fd, void **p)
 {
-    assert(d->type == 1);
-    auto wcache = new write_cache(blkno, fd, d->lsvd, 2);
+    auto wcache = make_write_cache(blkno, fd, d->lsvd, &d->cfg);
     *p = (void*)wcache;
 }
 extern "C" void wcache_close(write_cache *wcache)
@@ -167,43 +169,41 @@ extern "C" void wcache_close(write_cache *wcache)
 extern "C" void wcache_read(write_cache *wcache, char *buf, uint64_t offset, uint64_t len)
 {
     char *buf2 = (char*)aligned_alloc(512, len); // just assume it's not aligned
-    int _len = len;
     std::condition_variable cv;
     std::mutex m;
-    for (char *_buf = buf2; _len > 0; ) {
+
+    smartiov iovs(buf2, len);
+
+    for (size_t _offset = 0; _offset < len; ) {
         std::unique_lock lk(m);
-        bool done = false;
-        void *closure = wrap([&done, &cv, &m]{
-                std::unique_lock lk(m);
-                done = true;
-                cv.notify_all();
-                return true;
-            });
-        auto [skip_len, read_len] = wcache->async_read(offset, _buf, _len,
-                                                       call_wrapped, closure);
-        memset(_buf, 0, skip_len);
-        _buf += (skip_len + read_len);
-        _len -= (skip_len + read_len);
+	auto tmp = iovs.slice(_offset, len);
+        auto [skip_len, read_len, rreq] = wcache->async_readv(offset, &tmp);
+
+	if (skip_len) 
+	    iovs.zero(_offset, _offset + skip_len);
+
+        _offset += (skip_len + read_len);
         offset += (skip_len + read_len);
-        if (read_len > 0)
-            while (!done)
-                cv.wait(lk);
-        else
-            delete_wrapped(closure);
+
+	if (rreq != NULL) {
+	    rreq->run(NULL);
+	    rreq->wait();
+	    rreq->release();
+	}
     }
     memcpy(buf, buf2, len);
     free(buf2);
 }
+
 extern "C" void wcache_img_write(rbd_image_t image, char *buf, uint64_t offset, uint64_t len)
 {
     rbd_write((rbd_image_t)image, offset, len, buf);
 }
 extern "C" void wcache_write(write_cache *wcache, char *buf, uint64_t offset, uint64_t len)
 {
-    fake_rbd_image *fri = new fake_rbd_image;
-    fri->wcache = wcache;
-    wcache_img_write(fri, buf, offset, len);
-    delete fri;
+    auto img = make_rbd_image(NULL, NULL, wcache, NULL);
+    wcache_img_write(img, buf, offset, len);
+    delete img;
 }
 int wc_getmap_cb(void *ptr, int base, int limit, int plba)
 {
@@ -239,7 +239,7 @@ extern "C" void rcache_init(_dbg *d,
 			    uint32_t blkno, int fd, void **val_p)
 {
     auto rcache = make_read_cache(blkno, fd, false,
-				  d->lsvd, d->omap, d->io);
+				  d->lsvd, &d->obj_map, &d->obj_lock, d->io);
     *val_p = (void*)rcache;
 }
 extern "C" void rcache_shutdown(read_cache *rcache)
@@ -250,73 +250,159 @@ extern "C" void rcache_evict(read_cache *rcache, int n)
 {
     rcache->do_evict(n);
 }
+
+char *logbuf, *p_log, *end_log;
+#include <stdarg.h>
+std::mutex m;
+void do_log(const char *fmt, ...) {
+    std::unique_lock lk(m);
+    if (!logbuf) {
+	size_t sz = 64*1024;
+	const char *env = getenv("LSVD_DEBUG_BUF");
+	if (env)
+	    sz = atoi(env);
+	p_log = logbuf = (char*)malloc(sz);
+	end_log = p_log + sz;
+    }
+    va_list args;
+    va_start(args, fmt);
+    ssize_t max = end_log - p_log - 1;
+    if (max > 256)
+	p_log += vsnprintf(p_log, max, fmt, args);
+}
+
+FILE *_fp;
+void fp_log(const char *fmt, ...) {
+    //std::unique_lock lk(m);
+    if (_fp == NULL)
+	_fp = fopen("/tmp/lsvd.log", "w");
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(_fp, fmt, args);
+    fflush(_fp);
+}
+
+class read1_req : public trivial_request {
+    std::condition_variable *cv;
+    bool *done;
+    
+public:
+    read1_req(std::condition_variable *cv_, bool *done_) {
+	cv = cv_;
+	done = done_;
+    }
+    ~read1_req() { }
+
+    void notify(request *child) {
+	*done = true;
+	cv->notify_all();
+    }
+};
+
+/* note that this leaks read cache request structures, because it 
+ * doesn't call req->release()
+ */
 extern "C" void rcache_read(read_cache *rcache, char *buf,
 			    uint64_t offset, uint64_t len)
 {
     char *buf2 = (char*)aligned_alloc(512, len); // just assume it's not
-    int _len = len;
     std::mutex m;
     std::condition_variable cv;
+
+    smartiov iovs(buf2, len);
     
-    for (char *_buf = buf2; _len > 0; ) {
+    for (size_t _offset = 0; _offset < len; ) {
 	bool done = false;
-	void *closure = wrap([&m, &cv, &done]{
-		done = true;
-		cv.notify_all();
-		return true;
-	    });
-	auto [skip_len, read_len] = rcache->async_read(offset, _buf, _len,
-						       call_wrapped, closure);
-	memset(_buf, 0, skip_len);
-	_buf += (skip_len+read_len);
-	_len -= (skip_len+read_len);
-	offset += (skip_len+read_len);
-	if (read_len > 0) {
+	auto tmp = iovs.slice(_offset, len);
+	auto [skip_len, read_len, r_req] =
+	    rcache->async_readv(offset, &tmp);
+
+	if (skip_len) 
+	    iovs.zero(_offset, _offset + skip_len);
+
+	_offset += (skip_len+read_len); // buffer offset
+	offset += (skip_len+read_len);	// disk offset
+	if (r_req != NULL) {
+	    auto req1 = new read1_req(&cv, &done);
+	    r_req->run(req1);
 	    std::unique_lock lk(m);
 	    while (!done)
 		cv.wait(lk);
+	    r_req->release();
 	}
-	else
-	    delete_wrapped(closure);
     }
     memcpy(buf, buf2, len);
     free(buf2);
 }
+
+class read2_req : public trivial_request {
+public:
+    int refcnt = 0;
+    std::mutex m;
+    std::condition_variable cv;
+    bool started = false;
+    
+    read2_req() { }
+    ~read2_req() { }
+
+    void add_ref() {
+	std::unique_lock lk(m);
+	refcnt++;
+    }
+    void run(request *unused) {
+	std::unique_lock lk(m);
+	started = true;
+	if (refcnt == 0)
+	    cv.notify_all();
+    }
+    void notify(request *child) {
+	std::unique_lock lk(m);
+	if (--refcnt == 0 && started) 
+	    cv.notify_all();
+    }
+    void wait() {
+	std::unique_lock lk(m);
+	while (refcnt > 0)
+	    cv.wait(lk);
+    }
+};
+
+/* note that this leaks read cache request structures, because it 
+ * doesn't call req->release()
+ */
 extern "C" void rcache_read2(read_cache *rcache, char *buf,
 			    uint64_t offset, uint64_t len)
 {
     char *buf2 = (char*)aligned_alloc(512, len); // just assume it's not
-    int _len = len;
-    std::atomic<int> left(0);
-    std::mutex m;
     std::condition_variable cv;
+
+    smartiov iovs(buf2, len);
+
+    auto req = new read2_req();
     
-    for (char *_buf = buf2; _len > 0; ) {
-	void *closure = wrap([&cv, &left]{
-		if (--left == 0) {
-		    cv.notify_all();
-		    return true;
-		}
-		return false;
-	    });
-	left++;
-	auto [skip_len, read_len] = rcache->async_read(offset, _buf, _len,
-						       call_wrapped, closure);
-	memset(_buf, 0, skip_len);
-	_buf += (skip_len+read_len);
-	_len -= (skip_len+read_len);
+    for (size_t _offset = 0; _offset < len; ) {
+	auto tmp = iovs.slice(_offset, len);
+	auto [skip_len, read_len, r_req] =
+	    rcache->async_readv(offset, &tmp);
+
+	if (skip_len) 
+	    iovs.zero(_offset, _offset + skip_len);
+
+	_offset += (skip_len+read_len);
 	offset += (skip_len+read_len);
-	if (read_len == 0) {
-	    left--;
-	    delete_wrapped(closure);
+
+	if (r_req != NULL) {
+	    req->add_ref();
+	    r_req->run(req);
 	}
     }
-    std::unique_lock lk(m);
-    while (left.load() > 0)
-	cv.wait(lk);
+    req->run(NULL);
+    req->wait();
     memcpy(buf, buf2, len);
     free(buf2);
+    delete req;
 }
+
 extern "C" void rcache_add(read_cache *rcache, int object, int block, char *buf, size_t len)
 {
     assert(len == 65536);
@@ -355,9 +441,233 @@ extern "C" void fakemap_update(_dbg *d, int base, int limit,
 			       int obj, int offset)
 {
     extmap::obj_offset oo = {obj,offset};
-    d->omap->map.update(base, limit, oo);
+    d->obj_map.update(base, limit, oo);
+    d->lsvd->set_completion(obj+1);
 }
 extern "C" void fakemap_reset(_dbg *d)
 {
-    d->omap->map.reset();
+    d->obj_map.reset();
 }
+
+class aio_vreq {
+public:
+    enum lsvd_op op;
+    smartiov   iovs;
+    char      *buf;
+    bool       done = false;
+    rbd_completion_t c;
+    std::mutex m;
+    std::condition_variable cv;
+
+    aio_vreq(enum lsvd_op op_, char *buf_, size_t *sizes, int n) {
+	op = op_;
+	buf = buf_;
+	for (int i = 0; i < n; i++) {
+	    auto ptr = aligned_alloc(512, sizes[i]*512);
+	    iovs.push_back((iovec){ptr, sizes[i]*512});
+	}
+    }
+    ~aio_vreq() {
+	for (int i = 0; i < iovs.size(); i++)
+	    free(iovs[i].iov_base);
+    }
+};
+
+void aio_vreq_cb(rbd_completion_t c, void *arg) {
+    auto r = (aio_vreq*)arg;
+    std::unique_lock lk(r->m);
+    r->done = true;
+    r->cv.notify_one();
+    rbd_aio_release(c);
+}    
+
+extern "C" void *launch_rbd_aio_writev(rbd_image_t image, uint64_t offset,
+				      char *buf, size_t *sizes, int nsizes) {
+    auto req = new aio_vreq(OP_WRITE, buf, sizes, nsizes);
+    req->iovs.copy_in(buf);
+    auto [iov,niov] = req->iovs.c_iov();
+    
+    rbd_completion_t c;
+    rbd_aio_create_completion((void*)req, aio_vreq_cb, &c);
+    req->c = c;
+    rbd_aio_writev(image, iov, niov, offset, c);
+
+    return (void*)req;
+}
+extern "C" void wait_rbd_aio_writev(void *r) {
+    auto req = (aio_vreq*)r;
+    std::unique_lock lk(req->m);
+    while (!req->done)
+	req->cv.wait(lk);
+    lk.unlock();
+    delete req;
+}
+ 
+extern "C" void *launch_rbd_aio_readv(rbd_image_t image, uint64_t offset,
+				      char *buf, size_t *sizes, int nsizes) {
+    auto req = new aio_vreq(OP_READ, buf, sizes, nsizes);
+    auto [iov,niov] = req->iovs.c_iov();
+    
+    rbd_completion_t c;
+    rbd_aio_create_completion((void*)req, aio_vreq_cb, &c);
+    req->c = c;
+    rbd_aio_readv(image, iov, niov, offset, c);
+
+    return (void*)req;
+}
+
+extern "C" void wait_rbd_aio_readv(void *r) {
+    auto req = (aio_vreq*)r;
+    std::unique_lock lk(req->m);
+    while (!req->done)
+	req->cv.wait(lk);
+    req->iovs.copy_out(req->buf);
+    lk.unlock();
+    delete req;
+}
+
+struct waiter {
+    std::mutex m;
+    std::condition_variable cv;
+    bool done = false;
+};
+
+void waiter_cb(rbd_completion_t c, void *arg) {
+    auto w = (waiter*) arg;
+    std::unique_lock lk(w->m);
+    w->done = true;
+    w->cv.notify_one();
+    rbd_aio_release(c);
+}
+
+extern "C" int do_rbd_aio_writev(rbd_image_t image, const iovec *iov,
+		      int iovcnt, uint64_t offset) {
+    rbd_completion_t c;
+    waiter w;
+    
+    rbd_aio_create_completion((void*)&w, waiter_cb, &c);
+    rbd_aio_writev(image, iov, iovcnt, offset, c);
+    std::unique_lock lk(w.m);
+    while (!w.done)
+	w.cv.wait(lk);
+    return 0;
+}
+
+extern "C" int do_rbd_aio_readv(rbd_image_t image, const iovec *iov,
+		      int iovcnt, uint64_t offset) {
+    rbd_completion_t c;
+    waiter w;
+    
+    rbd_aio_create_completion((void*)&w, waiter_cb, &c);
+    rbd_aio_readv(image, iov, iovcnt, offset, c);
+    std::unique_lock lk(w.m);
+    while (!w.done)
+	w.cv.wait(lk);
+    return 0;
+}
+
+extern "C" void get_rbd_uuid(rbd_image_t image, uuid_t *uuid) {
+    auto img = (rbd_image *)image;
+    memcpy(uuid, img->xlate->uuid, sizeof(*uuid));
+}
+    
+/* random run-time debugging stuff, not used at the moment...
+ */
+#if 1
+#include <zlib.h>
+static std::map<int,uint32_t> sector_crc;
+char zbuf[512];
+static std::mutex zm;
+
+void add_crc(sector_t sector, iovec *iov, int niovs) {
+    std::unique_lock lk(zm);
+    for (int i = 0; i < niovs; i++) {
+	for (size_t j = 0; j < iov[i].iov_len; j += 512) {
+	    const unsigned char *ptr = j + (unsigned char*)iov[i].iov_base;
+	    sector_crc[sector] = (uint32_t)crc32(0, ptr, 512);
+	    sector++;
+	}
+    }
+}
+
+void check_crc(sector_t sector, iovec *iov, int niovs, const char *msg) {
+    std::unique_lock lk(zm);
+    for (int i = 0; i < niovs; i++) {
+	for (size_t j = 0; j < iov[i].iov_len; j += 512) {
+	    const unsigned char *ptr = j + (unsigned char*)iov[i].iov_base;
+	    if (sector_crc.find(sector) == sector_crc.end()) {
+		assert(memcmp(ptr, zbuf, 512) == 0);
+	    }
+	    else {
+		unsigned crc1 = 0, crc2 = 0;
+		assert((crc1 = sector_crc[sector]) == (crc2 = crc32(0, ptr, 512)));
+	    }
+	    sector++;
+	}
+    }
+}
+
+void list_crc(sector_t sector, int n) {
+    for (int i = 0; i < n; i++)
+	printf("%ld %08x\n", sector+i, sector_crc[sector+i]);
+}
+
+void printaddr(sector_t sector, rbd_image *img) {
+    sector_t base = sector, limit = base+8;
+    char buf[1024], *p = buf;
+    auto [wm,wmap] = img->wcache->getmap2();
+    {
+	std::unique_lock lk(*wm);
+	p += sprintf(p, " w %ld: [", sector);
+	for (auto it = wmap->lookup(base);
+	     it != wmap->end() && it->base() < limit; it++) {
+	    auto [_b,_l,_p] = it->vals(base, limit+512);
+	    p += sprintf(p, " %ld+%ld->%ld", _b, _l-_b, _p);
+	}
+	p += sprintf(p, " ]");
+	do_log("%s\n", buf);
+    }
+    {
+	p = buf;
+	std::shared_lock lk(img->map_lock);
+	p += sprintf(p, " r %ld: [", sector);
+	for (auto it = img->map.lookup(base);
+	     it != img->map.end() && it->base() < limit; it++) {
+	    auto [_b,_l,oo] = it->vals();
+	    p += sprintf(p, " %ld+%ld->%ld.%d", _b, _l-_b, oo.obj, (int)oo.offset);
+	}
+	p += sprintf(p, " ]");
+	do_log("%s\n", buf);
+    }
+}
+
+size_t iovsum(const iovec *iov, int iovcnt) {
+    int sum = 0;
+    for (int i = 0; i < iovcnt; i++)
+	sum += iov[i].iov_len;
+    return sum;
+}
+
+extern "C" void noop(void) {
+}
+
+extern "C" int rbd_getmap(sector_t base, sector_t limit, rbd_image *img, int max, struct tuple *t) {
+    getmap_s s = {0, max, t};
+    img->xlate->getmap(base, limit, getmap_cb, (void*)&s);
+    return s.i;
+}
+
+extern "C" void map_lookup(extmap::objmap *map, sector_t sector, int len) {
+    sector_t base = sector, limit = base+len;
+    auto it = map->lookup(base);
+    if (it == map->end())
+	printf("not found\n");
+    else if (it->base() >= limit)
+	printf("next entry: %d\n", (int)it->base());
+    else {
+	auto [_base, _limit, _ptr] = it->vals(base, limit);
+	printf("%ld %ld %ld+%d\n", _base, _limit, _ptr.obj, _ptr.offset);
+    }
+}
+
+#endif

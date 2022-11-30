@@ -10,19 +10,20 @@
 #include <libaio.h>
 #include <unistd.h>
 #include <sys/uio.h>
+#include <uuid/uuid.h>
+#include <signal.h>
 
 #include <mutex>
 #include <shared_mutex>
 #include <condition_variable>
 #include <thread>
 
-#include "base_functions.h"
+#include "lsvd_types.h"
 #include "smartiov.h"
 #include "extent.h"
 #include "misc_cache.h"
 #include "backend.h"
 #include "io.h"
-#include "translate.h"
 #include "request.h"
 
 #include "nvme.h"
@@ -31,8 +32,8 @@ class nvme_impl;
 
 class nvme_request : public request {
 public:
-    e_iocb     *eio;		// this is self-deleting. TODO: fix?
-    smartiov   *_iovs;
+    e_iocb      eio;
+    smartiov    _iovs;
     size_t      ofs;
     int         t;
     nvme_impl  *nvme_ptr;
@@ -45,11 +46,10 @@ public:
     
 public:
     nvme_request(smartiov *iov, size_t offset, int type, nvme_impl* nvme_w);
+    nvme_request(char *buf, size_t len, size_t offset, int type,
+		 nvme_impl* nvme_w);
     ~nvme_request();
 
-    sector_t lba();
-    smartiov *iovs();
-    bool is_done(void);
     void wait();
     void run(request *parent);
     void notify(request *child);
@@ -63,15 +63,23 @@ public:
     std::thread e_io_th;
     io_context_t ioctx;
 
+    static void sighandler(int sig) {
+	pthread_exit(NULL);
+    }
+    
     nvme_impl(int fd_, const char *name_) {
 	fd = fd_;
 	e_io_running = true;
 	io_queue_init(64, &ioctx);
+	signal(SIGUSR2, sighandler);
 	e_io_th = std::thread(e_iocb_runner, ioctx, &e_io_running, name_);
     }
 
     ~nvme_impl() {
 	e_io_running = false;
+	//e_io_th.join();
+	//pthread_cancel(e_io_th.native_handle());
+	pthread_kill(e_io_th.native_handle(), SIGUSR2);
 	e_io_th.join();
 	io_queue_release(ioctx);
     }
@@ -98,8 +106,19 @@ public:
 	return (request*) req;
     }
 
+    request* make_write_request(char *buf, size_t len, size_t offset) {
+	assert(offset != 0);
+	auto req = new nvme_request(buf, len, offset, WRITE_REQ, this);
+	return (request*) req;
+    }
+    
     request* make_read_request(smartiov *iov, size_t offset) {
 	auto req = new nvme_request(iov, offset, READ_REQ, this);
+	return (request*) req;
+    }
+
+    request* make_read_request(char *buf, size_t len, size_t offset) {
+	auto req = new nvme_request(buf, len, offset, READ_REQ, this);
 	return (request*) req;
     }
 };
@@ -117,9 +136,16 @@ void call_send_request_notify(void *parent)
 }
 
 nvme_request::nvme_request(smartiov *iov, size_t offset,
+			   int type, nvme_impl* nvme_w) : _iovs(iov->data(),
+								iov->size()) {
+    ofs = offset;
+    t = type;
+    nvme_ptr = nvme_w;
+}
+
+nvme_request::nvme_request(char *buf, size_t len, size_t offset,
 			   int type, nvme_impl* nvme_w) {
-    eio = new e_iocb;
-    _iovs = iov;
+    _iovs.push_back((iovec){buf, len});
     ofs = offset;
     t = type;
     nvme_ptr = nvme_w;
@@ -127,27 +153,26 @@ nvme_request::nvme_request(smartiov *iov, size_t offset,
 
 void nvme_request::run(request* parent_) {
     parent = parent_;
-    if (t == WRITE_REQ) {
-	e_io_prep_pwritev(eio, nvme_ptr->fd, _iovs->data(), _iovs->size(),
+    if (t == WRITE_REQ) 
+	e_io_prep_pwritev(&eio, nvme_ptr->fd, _iovs.data(), _iovs.size(),
 			  ofs, call_send_request_notify, this);
-	e_io_submit(nvme_ptr->ioctx, eio);
-
-    } else if (t == READ_REQ) {
-	e_io_prep_preadv(eio, nvme_ptr->fd, _iovs->data(), _iovs->size(),
+    else
+	e_io_prep_preadv(&eio, nvme_ptr->fd, _iovs.data(), _iovs.size(),
 			 ofs, call_send_request_notify, this);
-	e_io_submit(nvme_ptr->ioctx, eio);
-    } else
-	assert(false);
+    e_io_submit(nvme_ptr->ioctx, &eio);
 }
 
 void nvme_request::notify(request *child) {
-    parent->notify(this);
+    if (parent)
+	parent->notify(this);
+
+    std::unique_lock lk(m);
     complete = true;
-    {   std::unique_lock lk(m);
-	cv.notify_one();
-    }
-    if (released)
+    cv.notify_one();
+    if (released) {
+	lk.unlock();
 	delete this;
+    }
 }
 
 void nvme_request::wait() {
@@ -157,14 +182,12 @@ void nvme_request::wait() {
 }
 
 void nvme_request::release() {
+    std::unique_lock lk(m);
     released = true;
-    if (complete)		// TODO: atomic swap?
+    if (complete) {		// TODO: atomic swap?
+	lk.unlock();
 	delete this;
+    }
 }
 
 nvme_request::~nvme_request() {}
-
-bool nvme_request::is_done() { return complete; }
-sector_t nvme_request::lba() { return 0; } // no one needs this
-smartiov *nvme_request::iovs() { return NULL; }
-

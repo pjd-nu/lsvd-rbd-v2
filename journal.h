@@ -21,12 +21,15 @@ struct j_map_extent {
     uint64_t lba : 40;		// volume LBA (in sectors)
     uint64_t len : 24;		// length (sectors)
     uint64_t plba;		// on-SSD LBA
-};
+} __attribute__((packed));
 
 struct j_length {
     int32_t page;		// in pages
     int32_t len;		// in pages
-};
+    bool operator<(const j_length &other) const { // for sorting
+        return page < other.page;
+    }
+} __attribute__((packed));
 
 enum {LSVD_J_DATA    = 10,
       LSVD_J_CKPT    = 11,
@@ -41,13 +44,13 @@ struct j_hdr {
     uint32_t magic;
     uint32_t type;		// LSVD_J_DATA
     uint32_t version;		// 1
-    uuid_t   vol_uuid;		// must match backend volume
+    int32_t  len;		// in 4KB blocks, including header
     uint64_t seq;
-    uint32_t len;		// in 4KB blocks, including header
     uint32_t crc32;		// TODO: implement this
-    uint32_t extent_offset;	// in bytes
-    uint32_t extent_len;	// in bytes
-};
+    int32_t  extent_offset;	// in bytes
+    int32_t  extent_len;        // in bytes
+    int32_t  prev;              // reverse link for recovery
+} __attribute__((packed));
 
 /* probably in the second 4KB block of the parition
  * this gets overwritten every time we re-write the map. We assume the 4KB write is
@@ -57,40 +60,34 @@ struct j_write_super {
     uint32_t magic;
     uint32_t type;		// LSVD_J_W_SUPER
     uint32_t version;		// 1
-    uuid_t   vol_uuid;
 
-    uint64_t seq;		// next write sequence
+    uint32_t clean;
+    uint64_t seq;		// next write sequence (if clean)
 
     /* all values are in 4KB block units. */
     
     /* Map and length checkpoints live in this region. Allocation within this
      * range is arbitrary, just set {map/len}_{start/blocks/entries} properly
      */
-    uint32_t meta_base;
-    uint32_t meta_limit;
+    int32_t meta_base;
+    int32_t meta_limit;
     
     /* FIFO range is [base,limit), 
      *  valid range accounting for wraparound is [oldest,next)
      *  'wrapped' 
      */
-    uint32_t base;
-    uint32_t limit;
-    uint32_t next;
-    uint32_t oldest;
+    int32_t base;
+    int32_t limit;
+    int32_t next;
     
-    /* to checkpoint the map:
-     * - allocate enough blocks at the write frontiers
-     * - write LSVD_J_CKPT header + map entries
-     * - overwrite the write superblock
-     */
-    uint32_t map_start;		// type: j_map_extent
-    uint32_t map_blocks;
-    uint32_t map_entries;
+    int32_t map_start;		// type: j_map_extent
+    int32_t map_blocks;
+    int32_t map_entries;
 
-    uint32_t len_start;	// type: j_length
-    uint32_t len_blocks;
-    uint32_t len_entries;
-};
+    int32_t len_start;	// type: j_length
+    int32_t len_blocks;
+    int32_t len_entries;
+} __attribute__((packed));
 
 /* probably in the third 4KB block, never gets overwritten (overwrite map in place)
  * uses a fixed map with 1 entry per 64KB block
@@ -103,7 +100,6 @@ struct j_read_super {
     uint32_t magic;
     uint32_t type;		// LSVD_J_R_SUPER
     uint32_t version;		// 1
-    uuid_t   vol_uuid;
 
     int32_t unit_size;		// cache unit size, in sectors
 
@@ -116,11 +112,7 @@ struct j_read_super {
      */
     int32_t map_start;		// extmap::obj_offset
     int32_t map_blocks;
-
-    int32_t evict_type;		// eviction algorithm - TBD
-    int32_t evict_start;	// eviction state - TBD
-    int32_t evict_blocks;
-};
+} __attribute__((packed));
 
       
 /* this goes in the first 4KB block in the cache partition, and never
@@ -137,46 +129,6 @@ struct j_super {
     uint32_t read_super;
 
     uuid_t   vol_uuid;
-    uint32_t backend_type;
-};
-
-/* backend follows superblock
- */
-enum {LSVD_BE_FILE  = 20,
-      LSVD_BE_S3    = 21,
-      LSVD_BE_RADOS = 22};
-
-struct j_be_file {
-    uint16_t len;
-    char    prefix[0];
-};
-
-struct offset_len {
-    uint16_t offset;
-    uint16_t len;
-};
-
-struct j_be_s3 {
-    uint16_t use_https;
-    struct offset_len access_key;
-    struct offset_len secret_key;
-    struct offset_len hostname;
-    struct offset_len bucket;
-    struct offset_len prefix;
-};
-
-/* based on C example at https://docs.ceph.com/en/latest/rados/api/librados-intro/
- */
-struct j_be_rados {
-    struct offset_len cluster_name;
-    struct offset_len user_name;
-    struct offset_len config_file;
-};
-
-
-/* TODO: 
- * - superblock
- * - move volume UUID to superblock??? maybe have it everywhere.
- */
+} __attribute__((packed));
 
 #endif

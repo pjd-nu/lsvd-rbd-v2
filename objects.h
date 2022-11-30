@@ -33,7 +33,7 @@ enum obj_type {
 
 // hdr :	header structure used to contain data for separate objects in translation and write cache layers
 //		of the LSVD system
-struct hdr {
+struct obj_hdr {
     uint32_t magic;
     uint32_t version;		// 1
     uuid_t   vol_uuid;
@@ -41,7 +41,8 @@ struct hdr {
     uint32_t seq;		// same as in name
     uint32_t hdr_sectors;
     uint32_t data_sectors;	// hdr_sectors + data_sectors = size
-};
+    uint32_t crc;
+} __attribute__((packed));
 
 // super_hdr :	super block style structure for the header structure, containing various metadata on the current
 //		header structure it describes including offsets, checkpoint statistics, and size
@@ -59,7 +60,7 @@ struct super_hdr {
     uint32_t clones_len;
     uint32_t snaps_offset;
     uint32_t snaps_len;
-};
+} __attribute__((packed));
 
 /* ckpts: list of active checkpoints: array of uint32_t */
 
@@ -72,62 +73,64 @@ struct clone_info {
 } __attribute__((packed));
 
 struct snap_info {
-    uuid_t   snap_uuid;
     uint32_t seq;
-};
+    uint8_t  name_len;
+    char     name[0];
+} __attribute__((packed));
 
 
-struct data_hdr {
-    uint32_t last_data_obj;
-    uint32_t ckpts_offset;
-    uint32_t ckpts_len;
+struct obj_data_hdr {
+    uint64_t cache_seq;
     uint32_t objs_cleaned_offset;
     uint32_t objs_cleaned_len;
-    uint32_t map_offset;
-    uint32_t map_len;
-};
+    uint32_t data_map_offset;
+    uint32_t data_map_len;
+} __attribute__((packed));
 
 struct obj_cleaned {
     uint32_t seq;
     uint32_t was_deleted;
-};
+} __attribute__((packed));
 
 // we can omit the offset in a data header
 //
 struct data_map {
     uint64_t lba : 36;
     uint64_t len : 28;
-};
+} __attribute__((packed));
 
-struct ckpt_hdr {
-    uint32_t ckpts_offset;	// list includes self
+struct obj_ckpt_hdr {
+    uint64_t cache_seq;         // from last data object
+    uint32_t ckpts_offset;	// list includes self (TODO - not needed?)
     uint32_t ckpts_len;
-    uint32_t objs_offset;	// objects and sizes
+    uint32_t objs_offset;	// ckpt_obj[]
     uint32_t objs_len;
-    uint32_t deletes_offset;	// deferred deletes
+    uint32_t deletes_offset;	// deferred_delete[]
     uint32_t deletes_len;
-    uint32_t map_offset;
+    uint32_t map_offset;        // ckpt_mapentry[]
     uint32_t map_len;
-};
+} __attribute__((packed));
 
 struct ckpt_obj {
     uint32_t seq;
     uint32_t hdr_sectors;
     uint32_t data_sectors;
     uint32_t live_sectors;
-};
+} __attribute__((packed));
 
 struct deferred_delete {
     uint32_t seq;		// object deleted
     uint32_t time;		// current write frontier when cleaned
-};
+} __attribute__((packed));
 
 struct ckpt_mapentry {
     int64_t lba : 36;
     int64_t len : 28;
     int32_t obj;
     int32_t offset;
-};
+} __attribute__((packed));
+
+class backend;
 
 class object_reader {
     backend *objstore;
@@ -140,19 +143,24 @@ public:
     std::pair<char*,ssize_t> read_super(const char *name,
 					std::vector<uint32_t> &ckpts,
 					std::vector<clone_info*> &clones,
-					std::vector<snap_info> &snaps,
+					std::vector<snap_info*> &snaps,
 					uuid_t &uuid);
 
-    ssize_t read_data_hdr(const char *name, hdr &h, data_hdr &dh,
-			  std::vector<uint32_t> &ckpts,
+    ssize_t read_data_hdr(const char *name, obj_hdr &h, obj_data_hdr &dh,
 			  std::vector<obj_cleaned> &cleaned,
 			  std::vector<data_map> &dmap);
 
-    ssize_t read_checkpoint(const char *name,
+    ssize_t read_checkpoint(const char *name, uint64_t &cache_seq,
 			    std::vector<uint32_t> &ckpts,
 			    std::vector<ckpt_obj> &objects, 
 			    std::vector<deferred_delete> &deletes,
 			    std::vector<ckpt_mapentry> &dmap);
 };
+
+extern size_t obj_hdr_len(int n_entries);
+
+extern size_t make_data_hdr(char *hdr, size_t bytes, uint64_t cache_seq,
+                            std::vector<data_map> *entries,
+                            uint32_t seq, uuid_t *uuid);
 
 #endif

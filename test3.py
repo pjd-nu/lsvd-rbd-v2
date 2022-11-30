@@ -9,6 +9,7 @@ import mkdisk
 import mkcache
 import test2 as t2
 
+os.environ["LSVD_BACKEND"] = "file"
 nvme = '/tmp/nvme'
 img = '/tmp/bkt/obj'
 dir = os.path.dirname(img)
@@ -48,8 +49,10 @@ def c_hdr(fd, blk):
     b = bytearray(os.pread(fd, 4096, 4096*blk))
     o2 = lsvd.sizeof_j_hdr
     h = lsvd.j_hdr.from_buffer(b[0:o2])
-    n_exts = h.extent_len // lsvd.sizeof_j_extent
-    e = (lsvd.j_extent*n_exts).from_buffer(b[o2:o2+h.extent_len])
+    e = []
+    if h.magic == lsvd.LSVD_MAGIC:
+        n_exts = h.extent_len // lsvd.sizeof_j_extent
+        e = (lsvd.j_extent*n_exts).from_buffer(b[o2:o2+h.extent_len])
     return [h, e]
 
 def restart():
@@ -140,6 +143,7 @@ class tests(unittest.TestCase):
         wcache.write(4096, b'X'*4096)
         wcache.write(8192, b'Y'*4096)
         time.sleep(0.1)
+        xlate.flush()
         d = xlate.read(0, 4096*3)
         self.assertEqual(d, b'W'*4096 + b'X'*4096 + b'Y'*4096)
 
@@ -151,6 +155,7 @@ class tests(unittest.TestCase):
         wcache.write(4096, b'X'*4096)
         wcache.write(8192, b'Y'*4096)
         time.sleep(0.1)
+        xlate.flush()
 
         m1 = wcache.getmap(0, 1000)
         wcache.checkpoint()

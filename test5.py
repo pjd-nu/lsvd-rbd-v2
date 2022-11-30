@@ -11,7 +11,9 @@ import mkdisk
 import signal
 signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-nvme = '/tmp/nvme'
+os.environ["LSVD_BACKEND"] = "file"
+os.environ["LSVD_CONFIG_FILE"] = "/dev/null"
+nvme = '/tmp/obj.cache'
 img = '/tmp/bkt/obj'
 dir = os.path.dirname(img)
 
@@ -26,18 +28,21 @@ def inv(i, k, m):
     return _vals[i]
 
 def rbd_startup():
-    mkdisk.cleanup(img)
+    mkdisk.cleanup_files(img)
     sectors = 10*1024*2 # 10MB
     mkdisk.mkdisk(img, sectors)
+    mkcache.cleanup(nvme)
     mkcache.mkcache(nvme)
-    name = nvme + ',' + img
-    return lsvd.rbd_open(name)
+    return lsvd.rbd_open(img)
 
 def rbd_finish(_img):
     lsvd.rbd_close(_img)
 
 class tests(unittest.TestCase):
 
+    def test_0_null(self):
+        pass
+    
     def test_1_wcache_holes(self):
         _img = rbd_startup()
         lsvd.img_write(_img, 0, b'A'*20*1024)

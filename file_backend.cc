@@ -7,127 +7,268 @@
  *              LGPL-2.1-or-later
  */
 
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/uio.h>
+#include <libaio.h>
+#include <errno.h>
+#include <sys/stat.h>
+
 #include <map>
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <thread>
+#include <random>
+#include <algorithm>
 
-#include <fcntl.h>
-#include <unistd.h>
-
-#include "file_backend.h"
+#include "lsvd_types.h"
+#include "backend.h"
+#include "request.h"
+#include "smartiov.h"
 #include "io.h"
+#include "misc_cache.h"
+#include "objects.h"
 
+extern void do_log(const char *, ...);
 
-file_backend::file_backend() {
-    e_io_running = true;
-    io_queue_init(64, &ioctx);
-    const char *name = "file_backend_cb";
-    e_io_th = std::thread(e_iocb_runner, ioctx, &e_io_running, name);
+bool __lsvd_dbg_be_delay = false;
+long __lsvd_dbg_be_seed = 1;
+int __lsvd_dbg_be_threads = 10;
+int __lsvd_dbg_be_delay_ms = 5;
+bool __lsvd_dbg_rename = false;
+static std::mt19937_64 rng;
+
+class file_backend_req;
+
+void verify_obj(iovec *iov, int iovcnt) {
+    auto h = (obj_hdr*)iov[0].iov_base;
+    if (h->type != LSVD_DATA)
+	return;
+    auto dh = (obj_data_hdr*)(h+1);
+    auto map = (data_map*)((char*)h + dh->data_map_offset);
+    int n_map = dh->data_map_len / sizeof(data_map);
+    uint32_t sum = 0;
+    for (int i = 0; i < n_map; i++)
+	sum += map[i].len;
+    assert(sum == h->data_sectors);
 }
 
-file_backend::~file_backend() {
-    e_io_running = false;
-    e_io_th.join();
-    io_queue_release(ioctx);
-}
+class file_backend : public backend {
+    void worker(thread_pool<file_backend_req*> *p);
+    std::mutex m;
+    
+public:
+    file_backend(const char *prefix);
+    ~file_backend();
 
+    /* see backend.h 
+     */
+    int write_object(const char *name, iovec *iov, int iovcnt);
+    int read_object(const char *name, iovec *iov, int iovcnt, size_t offset);
+    int delete_object(const char *name);
+    int delete_prefix(const char *prefix);
+    
+    /* async I/O
+     */
+    request *make_write_req(const char *name, iovec *iov, int iovcnt);
+    request *make_read_req(const char *name, size_t offset,
+                           iovec *iov, int iovcnt);
+    request *make_read_req(const char *name, size_t offset,
+                           char *buf, size_t len);
+    thread_pool<file_backend_req*> workers;
+};
+
+#include <zlib.h>
+/* trivial methods 
+ */
 int file_backend::write_object(const char *name, iovec *iov, int iovcnt) {
     int fd;
     if ((fd = open(name, O_RDWR | O_CREAT | O_TRUNC, 0777)) < 0)
 	return -1;
     auto val = writev(fd, iov, iovcnt);
     close(fd);
-    return val < 0 ? -1 : 0;
+    return val < 0 ? -1 : val;
 }
 
 int file_backend::read_object(const char *name, iovec *iov, int iovcnt,
 				  size_t offset) {
     int fd;
     if ((fd = open(name, O_RDONLY)) < 0)
-	return -1;
+       return -1;
     if (fd < 0)
-	return -1;
-    int val = lseek(fd, offset, SEEK_SET);
-    if (val >= 0)
-	val = readv(fd, iov, iovcnt);
+       return -1;
+    auto val = preadv(fd, iov, iovcnt, offset);
     close(fd);
-    return val < 0 ? -1 : 0;
+    return val < 0 ? -1 : val;
 }
 
 int file_backend::delete_object(const char *name) {
-    if (unlink(name) < 0)
-	return -1;
+    int rv;
+    if (__lsvd_dbg_rename) {
+	std::string newname = std::string(name) + ".bak";
+	rv = rename(name, newname.c_str());
+    }
+    else
+	rv = unlink(name);
+    return rv < 0 ? -1 : 0;
+}
+
+int file_backend::delete_prefix(const char *prefix_) {
+    std::string prefix(prefix_);
+    auto dir = fs::path(prefix).parent_path();
+    std::string stem = fs::path(prefix).filename();
+
+    for (auto const& dir_entry : fs::directory_iterator{dir}) {
+	std::string entry{dir_entry.path().filename()};
+	if (strncmp(entry.c_str(), stem.c_str(), stem.size()) == 0)
+	    fs::remove(dir_entry.path());
+    }
     return 0;
+}
+
+void trim_partial(const char *_prefix) {
+    auto prefix = std::string(_prefix);
+    auto stem = fs::path(prefix).filename();
+    auto parent = fs::path(prefix).parent_path();
+    size_t stem_len = strlen(stem.c_str());
+
+    for (auto const& dir_entry : fs::directory_iterator{parent}) {
+	std::string entry{dir_entry.path().filename()};
+	if (strncmp(entry.c_str(), stem.c_str(), stem_len) == 0 &&
+	    entry.size() == stem_len + 9) {
+	    char buf[512];
+	    auto h = (obj_hdr *)buf;
+	    int fd = open(dir_entry.path().c_str(), O_RDONLY);
+	    struct stat sb;
+	    assert(fstat(fd, &sb) >= 0);
+	    int rv = read(fd, buf, sizeof(buf));
+	    if (rv < 512 || h->magic != LSVD_MAGIC ||
+		(h->hdr_sectors + h->data_sectors)*512 != sb.st_size) {
+		printf("deleting partial object: %s (%d vs %d)\n",
+		       dir_entry.path().c_str(), (int)sb.st_size,
+		       (int)(h->hdr_sectors + h->data_sectors));
+		rename(dir_entry.path().c_str(),
+		       (std::string(dir_entry.path()) + ".bak").c_str());
+	    }
+	    close(fd);
+	}
+    }
+}
+
+int iov_sum(iovec *iov, int niov) {
+    int sum = 0;
+    for (int i = 0; i < niov; i++)
+	sum += iov[i].iov_len;
+    return sum;
 }
 
 class file_backend_req : public request {
     enum lsvd_op    op;
     smartiov        _iovs;
     size_t          offset;
-    std::string     name;
-    io_context_t    ioctx;
+    char            name[64];
     request        *parent = NULL;
-    e_iocb         *eio;    // this is self-deleting. TODO: fix io.cc?
-    int             fd;
+    file_backend   *be;
+    int             fd = -1;
     
 public:
     file_backend_req(enum lsvd_op op_, const char *name_,
 		     iovec *iov, int iovcnt, size_t offset_,
-		     io_context_t ioctx_) : _iovs(iov, iovcnt), name(name_) {
+		     file_backend *be_) : _iovs(iov, iovcnt) {
 	op = op_;
 	offset = offset_;
-	ioctx = ioctx_;
+	be = be_;
+	strcpy(name, name_);
     }
     ~file_backend_req() {}
 
-    bool      is_done() {return false;} // TODO: ?????
     void      wait() {}		   // TODO: ?????
-    sector_t  lba() {return 0;}
-    smartiov *iovs() {return NULL;}
-
     void      run(request *parent);
     void      notify(request *child);
     void      release() {};
 
-    static void rw_cb_fn(void *ptr) {
-	auto req = (file_backend_req*)ptr;
-	req->notify(NULL);
+    void exec(void) {
+	auto [iov,niovs] = _iovs.c_iov();
+	if (op == OP_READ) {
+	    auto fd = open(name, O_RDONLY);
+	    assert(fd >= 0);
+	    auto rv = preadv(fd, iov, niovs, offset);
+	    assert(rv > 0);
+	    close(fd);
+	}
+	else {
+	    if ((fd = open(name,
+			   O_RDWR | O_CREAT | O_TRUNC, 0777)) < 0)
+		throw("file object error");
+	    if (pwritev(fd, iov, niovs, offset) < 0)
+		throw("file object error");
+	    close(fd);
+	}
+	notify(NULL);
     }
 };
+
+
+/* methods that depend on file_backend_req
+ */
+file_backend::file_backend(const char *prefix) : workers(&m) {
+    if (prefix)
+	trim_partial(prefix);
+    rng.seed(__lsvd_dbg_be_seed);
+    for (int i = 0; i < __lsvd_dbg_be_threads; i++) 
+	workers.pool.push(std::thread(&file_backend::worker, this, &workers));
+}
+
+file_backend::~file_backend() {
+}
+
+void file_backend::worker(thread_pool<file_backend_req*> *p) {
+    pthread_setname_np(pthread_self(), "file_worker");
+    while (p->running) {
+	file_backend_req *req;
+	if (!p->get(req)) 
+	    return;
+	if (__lsvd_dbg_be_delay) {
+	    std::uniform_int_distribution<int> uni(0,__lsvd_dbg_be_delay_ms*1000);
+	    useconds_t usecs = uni(rng);
+	    usleep(usecs);
+	}
+	req->exec();
+    }
+}
 
 /* TODO: run() ought to return error/success
  */
 void file_backend_req::run(request *parent_) {
     parent = parent_;
-    eio = new e_iocb;
-    int mode = (op == OP_READ) ? O_RDONLY : O_RDWR | O_CREAT | O_TRUNC;
-    if ((fd = open(name.c_str(), mode, 0777)) < 0)
-	throw("file object error");
-
-    auto [iov,iovcnt] = _iovs.c_iov();
-    if (op == OP_WRITE)
-	e_io_prep_pwritev(eio, fd, iov, iovcnt, offset, rw_cb_fn, this);
-    else if (op == OP_READ) 
-	e_io_prep_preadv(eio, fd, iov, iovcnt, offset, rw_cb_fn, this);
-    else
-	assert(false);
-    e_io_submit(ioctx, eio);
+    be->workers.put(this);
 }
 
 /* TODO: this assumes no use of wait/release
  */
 void file_backend_req::notify(request *unused) {
-    close(fd);
     parent->notify(this);
     delete this;
 }
 
 request *file_backend::make_write_req(const char*name, iovec *iov, int niov) {
-    return new file_backend_req(OP_WRITE, name, iov, niov, 0, ioctx);
+    assert(access(name, F_OK) != 0);
+    verify_obj(iov, niov);
+    return new file_backend_req(OP_WRITE, name, iov, niov, 0, this);
 }
 
 request *file_backend::make_read_req(const char *name, size_t offset,
 				     iovec *iov, int iovcnt) {
-    return new file_backend_req(OP_READ, name, iov, iovcnt, offset, ioctx);
+    return new file_backend_req(OP_READ, name, iov, iovcnt, offset, this);
+}
+
+request *file_backend::make_read_req(const char *name, size_t offset,
+				     char *buf, size_t len) {
+    iovec iov = {buf, len};
+    return new file_backend_req(OP_READ, name, &iov, 1, offset, this);
+}
+
+backend *make_file_backend(const char *prefix) {
+    return new file_backend(prefix);
 }
